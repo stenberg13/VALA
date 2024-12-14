@@ -2,7 +2,7 @@ name: Render Quarto Script Daily
 
 on:
   schedule:
-    - cron: '0 12 * * *'  # Runs daily at 12:00 UTC
+    - cron: '0 0 * * *'  # Runs daily at 12:00 AM UTC
 
 jobs:
   render-qmd:
@@ -22,11 +22,12 @@ jobs:
       # Step 3: Render Quarto Document
       - name: Render Quarto Document
         run: |
-          quarto render hello.qmd --to html
+          quarto render VALA_script.qmd --to html
 
       # Step 4: Upload Rendered Output
       - name: Upload Rendered File
         uses: actions/upload-artifact@v3
         with:
           name: rendered-document
-          path: hello.html  # Adjust this to the rendered file's name
+          path: VALA_script.html  # Adjust this to the rendered file's name
+
