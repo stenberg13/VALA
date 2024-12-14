@@ -1,8 +1,9 @@
 name: Render Quarto Script Daily
 
 on:
+  workflow_dispatch:  # This trigger allows manual workflow runs
   schedule:
-    - cron: '0 0 * * *'  # Runs daily at 12:00 AM UTC
+    - cron: '0 5 * * *'  # Runs daily at 12:00 UTC
 
 jobs:
   render-qmd:
@@ -30,4 +31,3 @@ jobs:
         with:
           name: rendered-document
           path: VALA_script.html  # Adjust this to the rendered file's name
-
