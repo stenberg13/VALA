@@ -22,19 +22,19 @@ jobs:
           sudo apt update
           sudo apt install -y libcurl4-openssl-dev
 
-      - name: Create Writable R Package Directory
-        run: |
-          mkdir -p /tmp/rmarkdown
-          chmod -R 777 /tmp/rmarkdown
-
       - name: Install rmarkdown
         run: |
           export R_LIBS_USER="/tmp/rmarkdown"
           R -e "install.packages('rmarkdown', lib='$R_LIBS_USER')"
 
-      - name: Build Quarto Document
+      - name: Create Writable R Package Directory
         run: |
-          quarto render .github/VALA_rmarkdown.Rmd --to pdf
+          mkdir -p /tmp/rmarkdown
+          chmod -R 777 /tmp/rmarkdown
+
+      - name: Render .Rmd file
+        run: |
+          Rscript -e "rmarkdown::render('.github/VALA_rmarkdown.Rmd')"
 
       - name: Cache icons
         uses: actions/cache@v2
@@ -44,9 +44,6 @@ jobs:
 
       - name: Get icons
         run: Rscript get_icons.R
-
-      - name: Build slides
-        run: Rscript .github/workflows/build_slides.R
 
       - name: Deploy to Main Repository
         run: |
