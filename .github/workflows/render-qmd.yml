@@ -1,40 +1,44 @@
-name: Render Quarto Script Daily
+name: Render documents and upload
 
 on:
-  workflow_dispatch:  # This trigger allows manual workflow runs
-  schedule:
-    - cron: '0 12 * * *'  # Runs daily at 12:00 UTC
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
 
 jobs:
-  render-qmd:
+  render_document:
     runs-on: ubuntu-latest
-
     steps:
-      # Step 1: Checkout the repository
-      - name: Checkout repository
-        uses: actions/checkout@v3
+      - name: Set up Git repository
+        uses: actions/checkout@v2
 
-      # Step 2: Install Quarto
       - name: Install Quarto
         run: |
           wget https://github.com/quarto-dev/quarto-cli/releases/download/v1.3.450/quarto-1.3.450-linux-amd64.deb
           sudo dpkg -i quarto-1.3.450-linux-amd64.deb
 
-      # Step 3: Install rmarkdown in a user-specific directory
       - name: Install rmarkdown
         run: |
           export R_LIBS_USER="/tmp/rmarkdown"
           R -e "install.packages('rmarkdown', lib='/tmp/rmarkdown')"
 
-      # Step 4: Render Quarto Document
       - name: Render Quarto Document
         run: |
-          quarto render .github/VALA_script.qmd --to html
+          quarto render .github/VALA_rmarkdown.Rmd --to html
 
-      # Step 5: Upload Rendered Output
-      - name: Upload Rendered File
-        uses: actions/upload-artifact@v3
+      - name: Commit files
+        run: |
+          git config --local core.autocrlf false
+          git config --local user.email "${{ github.actor }}@users.noreply.github.com"
+          git config --local user.name "${{ github.actor }}"
+          git add . && git add --renormalize .
+          git pull origin ${{ github.head_ref }} --autostash --rebase -X ours
+          git commit --allow-empty -am "AUTO-GH ACTION: ${{ github.workflow }}"
+          NO_PAGER=1 git --no-pager diff HEAD^
+
+      - name: Push changes
+        uses: ad-m/github-push-action@master
         with:
-          name: rendered-document
-          path: VALA_script.html  # Adjust this to the rendered file's name
-
+          branch: ${{ github.head_ref }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
