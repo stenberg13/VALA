@@ -1,31 +1,33 @@
-name: Render Quarto Script
+name: Render Quarto Script Daily
 
 on:
+  workflow_dispatch:  # This trigger allows manual workflow runs
   schedule:
-    - cron: '0 12 * * *'  # Runs daily at noon
-  workflow_dispatch:  # Allows manual trigger from the Actions tab
-    inputs:
-      # Define any input parameters if needed
-      file_path:
-        description: 'Path to the Quarto script to render'
-        required: true
-        default: '.github/VALA_script.qmd'
+    - cron: '0 12 * * *'  # Runs daily at 12:00 UTC
 
 jobs:
-  build:
+  render-qmd:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v2
+      # Step 1: Checkout the repository
+      - name: Checkout repository
+        uses: actions/checkout@v3
 
-    - name: Install Quarto
-      run: |
-        sudo apt-get update -y
-        sudo apt-get install quarto -y
+      # Step 2: Install Quarto
+      - name: Install Quarto
+        run: |
+          wget https://github.com/quarto-dev/quarto-cli/releases/download/v1.3.450/quarto-1.3.450-linux-amd64.deb
+          sudo dpkg -i quarto-1.3.450-linux-amd64.deb
 
-    - name: Render Quarto Document
-      run: quarto render ${{ inputs.file_path }} --to html
+      # Step 3: Render Quarto Document
+      - name: Render Quarto Document
+        run: |
+          quarto render .github/VALA_script.qmd --to html
 
-    - name: Upload Rendered File
-      # Add steps to upload your rendered output file if needed
+      # Step 4: Upload Rendered Output
+      - name: Upload Rendered File
+        uses: actions/upload-artifact@v3
+        with:
+          name: rendered-document
+          path: VALA_script.html  # Adjust this to the rendered file's name
