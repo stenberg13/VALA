@@ -22,15 +22,15 @@ jobs:
           sudo apt update
           sudo apt install -y libcurl4-openssl-dev
 
+      - name: Create and configure R library directory
+        run: |
+          mkdir -p /usr/local/lib/R/site-library
+          chmod -R 755 /usr/local/lib/R/site-library
+
       - name: Install rmarkdown
         run: |
-          export R_LIBS_USER="/tmp/rmarkdown"
+          export R_LIBS_USER="/usr/local/lib/R/site-library"
           R -e "install.packages('rmarkdown', lib='$R_LIBS_USER')"
-
-      - name: Create Writable R Package Directory
-        run: |
-          mkdir -p /tmp/rmarkdown
-          chmod -R 777 /tmp/rmarkdown
 
       - name: Render .Rmd file
         run: |
