@@ -3,6 +3,13 @@ name: Render Quarto Script
 on:
   schedule:
     - cron: '0 12 * * *'  # Runs daily at noon
+  workflow_dispatch:  # Allows manual trigger from the Actions tab
+    inputs:
+      # Define any input parameters if needed
+      file_path:
+        description: 'Path to the Quarto script to render'
+        required: true
+        default: '.github/VALA_script.qmd'
 
 jobs:
   build:
@@ -18,7 +25,7 @@ jobs:
         sudo apt-get install quarto -y
 
     - name: Render Quarto Document
-      run: quarto render .github/VALA_script.qmd --to html
+      run: quarto render ${{ inputs.file_path }} --to html
 
     - name: Upload Rendered File
       # Add steps to upload your rendered output file if needed
