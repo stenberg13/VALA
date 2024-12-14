@@ -22,24 +22,19 @@ jobs:
           sudo apt update
           sudo apt install -y libcurl4-openssl-dev
 
-      - name: Install Quarto
+      - name: Install rmarkdown
         run: |
-          wget https://github.com/quarto-dev/quarto-cli/releases/download/v1.3.450/quarto-1.3.450-linux-amd64.deb
-          sudo dpkg -i quarto-1.3.450-linux-amd64.deb
+          export R_LIBS_USER="/tmp/rmarkdown"
+          R -e "install.packages('rmarkdown', lib='$R_LIBS_USER')"
 
       - name: Create Writable R Package Directory
         run: |
           mkdir -p /tmp/rmarkdown
           chmod -R 777 /tmp/rmarkdown
 
-      - name: Install rmarkdown
+      - name: Render .Rmd file
         run: |
-          export R_LIBS_USER="/tmp/rmarkdown"
-          R -e "install.packages('rmarkdown', lib='$R_LIBS_USER')"
-
-      - name: Build Quarto Document
-        run: |
-          quarto render .github/VALA_rmarkdown.Rmd --to pdf
+          Rscript -e "rmarkdown::render('.github/VALA_rmarkdown.Rmd')"
 
       - name: Cache icons
         uses: actions/cache@v2
@@ -49,9 +44,6 @@ jobs:
 
       - name: Get icons
         run: Rscript get_icons.R
-
-      - name: Build slides
-        run: Rscript .github/workflows/build_slides.R
 
       - name: Deploy to Main Repository
         run: |
