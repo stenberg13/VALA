@@ -30,4 +30,5 @@ jobs:
         uses: actions/upload-artifact@v3
         with:
           name: rendered-document
-          path: VALA_script.html  # Adjust this to the rendered file's name
+          path: .github/VALA_script.qmd
+  # Adjust this to the rendered file's name
