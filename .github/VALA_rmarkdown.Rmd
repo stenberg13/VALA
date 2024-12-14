@@ -1,0 +1,1300 @@
+---
+title: "VALA_SCRIPT"
+author: "Seth Tenberg"
+date: "2024-12-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+---
+title: "Volatility Adjusted Leverage Allocation"
+format: html
+editor: visual
+---
+
+```{r}
+#| label: load-packages
+#| include: false
+
+# fix calculations and make this automatic
+library(moments)
+library(knitr)
+library(formattable)
+
+library(ggpubr)
+library(tidyverse)
+library(palmerpenguins)
+library(quantmod)
+library(rugarch)
+library(MSGARCH)
+library(zoo)
+library(foreach)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+```
+
+## Volatility Adjusted Leverage Allocation (VALA)
+
+In today's post, we delve into the recent performance and allocations of our dynamic leverage model. The model uses volatility forecasts to adjust leverage, optimizing returns while managing risk. We will look at the most recent allocations, and compare the strategy's backtested performance against the S&P 500, including the adjustments made based on forecasted volatility.
+
+### 1. Model Overview
+
+We rely on several key financial metrics in our model:
+
+-   **S&P 500 (SPY)** as the market benchmark.
+
+-   **UPRO**, a leveraged ETF that amplifies the S&P 500 daily returns by 3 times.
+
+-   **Target volatility** — we target a specified volatility for our portfolio and adjust leverage accordingly.
+
+-   **Volatility forecast** — the model uses a rolling GARCH (Generalized Autoregressive Conditional Heteroskedasticity) model to forecast future volatility based on past returns.
+
+The model's goal is to adjust leverage dynamically based on these forecasts, aiming for a specified target volatility and maximizing returns while keeping risk under control.
+
+decscribe model here
+
+## 2. Recent Performance
+
+
+```{r}
+#| label: recent performance
+#| warning: false
+#| echo: false
+ticker <- "^GSPC"
+start_date <- "1978-01-01"
+end_date <- Sys.Date()
+
+# Download data
+getSymbols(ticker, from = start_date, to = end_date, src = "yahoo", adjust = TRUE)
+
+# Convert to dataframes and add Date column
+sp500_df <- as.data.frame(GSPC) %>%
+  mutate(Date = index(GSPC))
+
+# Pull the 3-month Treasury bill rate (DGS3MO) from FRED
+getSymbols("DGS3MO", src = "FRED", from = start_date, to = end_date)
+
+# Convert the data to a dataframe and adjust the column name
+tbill_df <- data.frame(
+  Date = index(DGS3MO),
+  TBill_Rate = DGS3MO$DGS3MO / 100 # Convert to decimal
+)
+
+# Fill missing values using the previous non-NA value
+tbill_df$DGS3MO <- zoo::na.locf(tbill_df$DGS3MO, na.rm = FALSE)
+
+sp500_df <- sp500_df %>%
+  left_join(tbill_df, by = "Date")
+
+# Calculate log returns for SP500
+sp500_df <- sp500_df %>%
+  mutate(
+    Log_Returns = log(Cl(GSPC) / lag(Cl(GSPC))),
+    Percentage_Change = (Cl(GSPC) / lag(Cl(GSPC)) - 1)
+  ) %>%
+  drop_na()
+
+# Calculate Adjusted UPRO Returns
+sp500_df$Adjusted_UPRO_Returns <- (sp500_df$Percentage_Change * 3) - sp500_df$DGS3MO / 252 - (0.0091/252) - (0.015/252)
+
+# Prepare for forecasting volatility (using GARCH model)
+# Set rolling window size for volatility forecast
+window_size <- 504
+spec <- CreateSpec(variance.spec = list(model = c("sGARCH")), 
+                   distribution.spec = list(distribution = c("std")))
+
+# Prepare to store out-of-sample volatility forecasts
+out_of_sample_vol_spy <- rep(NA, nrow(sp500_df))
+progress_counter <- 0
+total_iterations <- nrow(sp500_df) - window_size
+
+# Forecast volatility using rolling window and GARCH model
+for (i in seq(window_size, nrow(sp500_df) - 1)) {
+  rolling_window <- sp500_df$Log_Returns[(i - window_size + 1):i]
+  
+  fit_spy <- tryCatch({
+    FitML(spec, rolling_window)
+  }, error = function(e) {
+    NA  # Return NA if there's an error
+  })
+  
+  if (!is.na(fit_spy)) {
+    forecast <- tryCatch({
+      predict(fit_spy, n.ahead = 1)
+    }, error = function(e) {
+      list(vol = 0)  # If forecasting fails, set volatility to 0
+    })
+    
+    out_of_sample_vol_spy[i + 1] <- forecast$vol[1]
+  } else {
+    out_of_sample_vol_spy[i + 1] <- 0
+  }
+  
+  progress_counter <- progress_counter + 1
+}
+
+# Replace zeros with the previous non-zero value
+out_of_sample_vol_spy <- zoo::na.locf(out_of_sample_vol_spy, na.rm = FALSE)
+
+sp500_df <- sp500_df %>%
+  mutate(Forecasted_Volatility = out_of_sample_vol_spy)
+
+sp500_df <- sp500_df %>%
+  drop_na(Forecasted_Volatility)
+
+
+# Define parameters
+target_vols <- c(0.17 / sqrt(252))  # Target volatility (in daily terms)
+threshold <- 1  
+leverage = 20 # Threshold for rebalancing (when the difference in leverage exceeds this, rebalance)
+initial_investment = 100  # Initial investment amount
+
+# Initialize result list
+results <- list()
+
+# Loop over the target volatilities
+for (V_target in target_vols) {
+  
+  sp500_df <- sp500_df %>%
+    # Calculate today's leverage based on forecasted volatility
+    mutate(
+      Leverage = pmin((V_target / Forecasted_Volatility)^leverage, 3),  # Apply dynamic leverage power
+      
+      # Store the previous day's leverage
+      Previous_Leverage = lag(Leverage, 1),
+      
+      # Check if the leverage change exceeds the threshold compared to the previous day's leverage
+      Rebalance = ifelse(abs(Leverage - Previous_Leverage) >= threshold, 1, 0),  # Only rebalance if the difference exceeds threshold
+      
+      # Adjust leverage based on rebalancing, otherwise retain previous leverage
+      Leverage_Adjusted = ifelse(Rebalance == 1, Leverage, lag(Leverage, 1)),
+      
+      # Calculate weights for SPY and UPRO based on the adjusted leverage
+      Weight_UPRO_Adjusted = pmin(Leverage_Adjusted / 3, 1),  # UPRO weight based on leverage
+      Weight_SPY_Adjusted = 1 - Weight_UPRO_Adjusted         # SPY weight is the remainder
+    ) %>%
+    # Filter out rows with NA leverage (typically the first row)
+    filter(!is.na(Weight_SPY_Adjusted) & !is.na(Weight_UPRO_Adjusted))
+  
+  # Compute portfolio returns and cumulative portfolio value
+  sp500_df <- sp500_df %>%
+    mutate(
+      Portfolio_Return = Weight_SPY_Adjusted * Percentage_Change + Weight_UPRO_Adjusted * Adjusted_UPRO_Returns,
+      Cumulative_Portfolio = initial_investment * cumprod(1 + Portfolio_Return) - 1
+    )
+  
+  # Store results for this parameter combination
+  results[[paste0("Vol_", V_target)]] <- sp500_df %>%
+    select(Date, Leverage, Weight_SPY_Adjusted, Weight_UPRO_Adjusted, Portfolio_Return, Cumulative_Portfolio)
+}
+
+# Add the cumulative returns for SPY to results_clean
+sp500_df <- sp500_df %>%
+  mutate(Cumulative_Market = initial_investment * cumprod(1 + Percentage_Change),
+          Cumulative_UPRO = initial_investment * cumprod(1 + Adjusted_UPRO_Returns))
+# Ensure all cumulative returns are numeric in the strategy results
+results_clean <- lapply(results, function(df) {
+  df %>%
+    mutate(
+      Portfolio_Return = as.numeric(Portfolio_Return),  # Convert xts to numeric
+      Cumulative_Portfolio = as.numeric(Cumulative_Portfolio)    )
+})
+# Combine the SPY (market) cumulative return with the strategy returns
+plot_data <- bind_rows(lapply(names(results_clean), function(vol_target) {
+  results_clean[[vol_target]] %>%
+    mutate(Strategy = "VALA")  # Change vol_target to "VALA"
+}), .id = "Strategy")
+
+plot_data$Strategy <- ifelse(plot_data$Strategy == "1", "VALA", plot_data$Strategy)
+
+
+# Add the market data (SPY cumulative return) to plot_data, ensure Cumulative_Market is numeric
+market_data <- sp500_df %>%
+  select(Date, Cumulative_Market, Cumulative_UPRO) %>%
+  mutate(Strategy = "Market", Cumulative_Market = as.numeric(Cumulative_Market))  # Convert Cumulative_Market to numeric
+upro_data <- sp500_df %>%
+  select(Date, Cumulative_UPRO) %>%
+  mutate(Strategy = "UPRO", Cumulative_UPRO = as.numeric(Cumulative_UPRO))  # Convert Cumulative_Market to numeric
+
+# Combine strategies and market data
+plot_data_combined <- bind_rows(
+  plot_data %>%
+    rename(Cumulative_Returns = Cumulative_Portfolio) %>%
+    select(Date, Strategy, Cumulative_Returns),
+  market_data %>%
+    rename(Cumulative_Returns = Cumulative_Market) %>%
+    select(Date, Strategy, Cumulative_Returns),
+   upro_data %>%
+    rename(Cumulative_Returns = Cumulative_UPRO) %>%
+    select(Date, Strategy, Cumulative_Returns)
+)
+
+# Filter plot_data_combined for dates after 2020-01-01
+plot_data_combined_2020 <- plot_data_combined %>%
+  filter(Date > "2020-01-01")
+
+# Merge with the necessary columns from sp500_df
+plot_data_combined_2020 <- plot_data_combined_2020 %>%
+  left_join(sp500_df %>% select(Date, Percentage_Change, Adjusted_UPRO_Returns, Portfolio_Return),
+            by = "Date")
+
+# Convert the xts data to numeric
+plot_data_combined_2020 <- plot_data_combined_2020 %>%
+  mutate(
+    Percentage_Change = as.numeric(Percentage_Change),
+    Adjusted_UPRO_Returns = as.numeric(Adjusted_UPRO_Returns),
+    Portfolio_Return = as.numeric(Portfolio_Return)
+  )
+
+# Recalculate cumulative returns for each strategy
+plot_data_combined_2020 <- plot_data_combined_2020 %>%
+  group_by(Strategy) %>%
+  mutate(
+    # Recalculate Cumulative_Returns for each strategy
+    Cumulative_Returns = case_when(
+      Strategy == "UPRO" ~ initial_investment * cumprod(1 + Adjusted_UPRO_Returns) - 1,
+      Strategy == "Market" ~ initial_investment * cumprod(1 + Percentage_Change) - 1,
+      TRUE ~ initial_investment * cumprod(1 + Portfolio_Return) - 1
+    )
+  ) %>%
+  ungroup()
+```
+
+```{r}
+if (tail(sp500_df$Weight_UPRO_Adjusted, 1) == 1) {
+  print("Invest in UPRO, we are in an aggressive regime")
+} else {
+  print("Invest in SPY, we are in a conservative regime")
+}
+```
+
+```{r}
+# Plot cumulative returns with log scale
+ggplot(plot_data_combined_2020, aes(x = Date, y = 1 + Cumulative_Returns, color = Strategy)) +
+  geom_line(size = 1) +
+  scale_y_log10() +  # Apply log scale
+  labs(
+    title = "Cumulative Returns for Strategy, S&P500, and UPRO",
+    x = "Date",
+    y = "Cumulative Returns (Log Scale)",
+    color = "Strategy"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "bottom"
+  )
+
+```
+
+### 3. Allocation of the Model
+
+```{r}
+#| label: allocation
+#| warning: false
+#| echo: true
+
+ggplot(sp500_df) +
+  # Add shaded region when Weight_UPRO_Adjusted is 1
+  geom_rect(data = sp500_df %>% filter(Weight_UPRO_Adjusted == 1),
+            aes(xmin = Date, xmax = Date+1, ymin = -Inf, ymax = Inf),
+            fill = "lightblue", alpha = 0.5) +  # Adjusted opacity and color
+  # Plot the Weight_UPRO_Adjusted line
+  # Plot the Forecasted_Volatility line
+  geom_line(aes(x = Date, y = Forecasted_Volatility), color = "red", size = 1) +
+  labs(
+    title = "Leveraged Exposure vs. Forecasted Volatility",
+    x = "Date",
+    color = "Strategy"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5)
+  )
+```
+
+-   Blue shading indicates a 100% allocation to UPRO.
+
+-   During periods of low forecasted volatility the allocation to UPRO (blue shading) increases significantly, maximizing returns through leverage.
+
+-   As volatility rises, the model reduces UPRO exposure and reallocates toward SPY to protect against potential losses.
+
+```{=html}
+<!-- -->
+```
+-   **Conclusion**:\
+    VALA's risk-adjusted approach allows it to optimize exposure during calm markets while minimizing risks during periods of uncertainty.
+
+How has the model allocated over time?\
+
+```{r}
+ggplot(sp500_df, aes(x = Date)) +
+  # For Regime 1: Use geom_rect to fill the area where Weight_UPRO_Adjusted == 1
+  geom_rect(aes(xmin = Date, xmax = lead(Date, default = last(Date)), ymin = 0, ymax = ifelse(Weight_UPRO_Adjusted == 1, Cumulative_Portfolio, NA), fill = "Regime 1"), alpha = 0.5) +
+  # For Regime 0: Use geom_rect to fill the area where Weight_UPRO_Adjusted != 1
+  geom_rect(aes(xmin = Date, xmax = lead(Date, default = last(Date)), ymin = 0, ymax = ifelse(Weight_UPRO_Adjusted != 1, Cumulative_Portfolio, NA), fill = "Regime 0"), alpha = 0.5) +
+  # Add line for the Cumulative Portfolio
+  geom_line(aes(y = Cumulative_Portfolio), color = "black", size = 1) +
+  # Define titles and labels
+  labs(title = "Regime Allocations Over Time for VALA", x = "Date", y = "Cumulative Portfolio Value") +
+  scale_y_log10() +  # Apply log scale for better visualization
+  scale_fill_manual(values = c("Regime 1" = "red", "Regime 0" = "blue"), 
+                    labels = c("Regime 1" = "Low Volatility (UPRO)", "Regime 0" = "High Volatility (SPY)")) +  # Customize the legend
+  theme_minimal() +
+  theme(legend.title = element_blank(), 
+        legend.position = "top")  # Display legend at the top
+```
+
+How prevalent was trading? Trading costs and slippage are not accounted for in this model because of how *relatively* infrequent trading is.
+
+```{r}
+sp500_df <- sp500_df %>%
+  mutate(Year = format(Date, "%Y"))
+# Step 2: Calculate the number of trades per year
+# A trade is defined as a change in Weight_UPRO_Adjusted
+trade_counts <- sp500_df %>%
+  group_by(Year) %>%
+  summarize(Trades = sum(Rebalance, na.rm = TRUE))
+
+# Step 3: Create a bar plot
+ggplot(trade_counts, aes(x = Year, y = Trades)) +
+  geom_bar(stat = "identity", fill = "skyblue", color = "black") +
+  labs(
+    title = "Number of Trades Per Year",
+    x = "Year",
+    y = "Number of Trades"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Even in recent years, the model suggests only 20-30 of trades a year.
+
+-   Trade counts remain relatively low, averaging under 30 trades per year.
+
+-   This low frequency indicates an efficient strategy with minimal transaction costs.
+
+```{=html}
+<!-- -->
+```
+-   **Conclusion**:\
+    The low trading frequency underscores VALA's efficiency in balancing returns and costs, making it a practical option for implementation.
+
+### 4. Historical Backtest
+
+text text text
+
+```{r}
+
+
+# Plot cumulative returns with log scale
+ggplot(plot_data_combined, aes(x = Date, y = 1 + Cumulative_Returns, color = Strategy)) +
+  geom_line(size = 1) +
+  scale_y_log10() +  # Apply log scale
+  labs(
+    title = "Cumulative Returns for Strategy, S&P500, and UPRO",
+    x = "Date",
+    y = "Cumulative Returns (Log Scale)",
+    color = "Strategy"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "bottom"
+  )
+
+```
+
+```{r}
+#| label: cagr
+#| warning: false
+#| echo: false
+
+sp500_df <- sp500_df %>%
+  mutate(
+    Cumulative_Portfolio_Peak = cummax(Cumulative_Portfolio),  # Rolling peak for portfolio
+    Drawdown_Portfolio = (Cumulative_Portfolio - Cumulative_Portfolio_Peak) / Cumulative_Portfolio_Peak,  # Portfolio drawdown
+    
+    Cumulative_Market_Peak = cummax(Cumulative_Market),  # Rolling peak for market
+    Drawdown_Market = (Cumulative_Market - Cumulative_Market_Peak) / Cumulative_Market_Peak,  # Market drawdown
+    
+    Cumulative_UPRO_Peak = cummax(Cumulative_UPRO),  # Rolling peak for UPRO
+    Drawdown_UPRO = (Cumulative_UPRO - Cumulative_UPRO_Peak) / Cumulative_UPRO_Peak  # UPRO drawdown
+  )
+
+
+
+# Define the function for calculating CAGR
+calculate_cagr <- function(cumulative_returns) {
+  # Calculate beginning and ending values
+  beginning_value <- cumulative_returns[1]
+  ending_value <- tail(cumulative_returns, 1)
+  
+  # Calculate the number of years
+  years <- length(cumulative_returns) / 252
+  
+  # Calculate CAGR
+  cagr <- (ending_value / beginning_value)^(1 / years) - 1
+  
+  return(cagr)
+}
+
+strategy_cagr <- calculate_cagr(as.numeric(sp500_df$Cumulative_Portfolio))
+spy_cagr <- calculate_cagr(as.numeric(sp500_df$Cumulative_Market))
+upro_cagr <- calculate_cagr(as.numeric(sp500_df$Cumulative_UPRO))
+
+
+# Step 1: Calculate excess returns (returns minus risk-free rate)
+strategy_excess <- sp500_df$Portfolio_Return - sp500_df$DGS3MO/252
+spy_excess <- sp500_df$Percentage_Change - sp500_df$DGS3MO/252
+upro_excess <- sp500_df$Adjusted_UPRO_Returns - sp500_df$DGS3MO/252
+
+# Combine into a data frame
+returns_df <- data.frame(
+  Strategy = strategy_excess,
+  SPY = spy_excess,
+  UPRO = upro_excess
+)
+
+returns_df <- returns_df %>%
+  rename(
+    Strategy = GSPC.Close,
+    SPY = GSPC.Close.1,
+    UPRO = UPRO
+  )
+
+# Step 2: Generate random weights for portfolio combinations
+set.seed(124)
+num_portfolios <- 10000
+weights <- matrix(runif(num_portfolios * 3), ncol = 3)
+weights <- weights / rowSums(weights)  # Normalize weights to sum to 1
+
+# Step 3: Calculate portfolio mean and standard deviation
+portfolio_stats <- apply(weights, 1, function(w) {
+  portfolio_return <- sum(w * colMeans(returns_df))
+  portfolio_sd <- sqrt(t(w) %*% cov(returns_df) %*% w)
+  c(portfolio_return, portfolio_sd)
+})
+
+portfolio_stats <- as.data.frame(t(portfolio_stats))
+names(portfolio_stats) <- c("Return", "Risk")
+portfolio_stats$Sharpe <- portfolio_stats$Return / portfolio_stats$Risk
+
+# Add mean and SD for the three strategies to overlay as points
+strategy_points <- data.frame(
+  Asset = c("Strategy", "SPY", "UPRO"),
+  Risk = c(sd(strategy_excess), sd(spy_excess), sd(upro_excess)),
+  Return = c(mean(strategy_excess), mean(spy_excess), mean(upro_excess)),
+  Sharpe = c(mean(strategy_excess) / sd(strategy_excess), 
+             mean(spy_excess) / sd(spy_excess), 
+             mean(upro_excess) / sd(upro_excess)))
+```
+
+```{r}
+vol_portfolio <- sd(sp500_df$Portfolio_Return, na.rm = TRUE) * sqrt(252)
+vol_market <- sd(sp500_df$Percentage_Change, na.rm = TRUE) * sqrt(252)
+vol_upro <- sd(sp500_df$Adjusted_UPRO_Returns, na.rm = TRUE) * sqrt(252)
+
+# Sharpe Ratios
+sharpe_portfolio <- mean(strategy_excess, na.rm = TRUE) / sd(sp500_df$Portfolio_Return, na.rm = TRUE)
+sharpe_market <- mean(spy_excess, na.rm = TRUE) / sd(sp500_df$Percentage_Change, na.rm = TRUE)
+sharpe_upro <- mean(upro_excess, na.rm = TRUE) / sd(sp500_df$Adjusted_UPRO_Returns, na.rm = TRUE)
+
+# Maximum Drawdown
+max_drawdown_portfolio <- min(sp500_df$Drawdown_Portfolio, na.rm = TRUE)
+max_drawdown_market <- min(sp500_df$Drawdown_Market, na.rm = TRUE)
+max_drawdown_upro <- min(sp500_df$Drawdown_UPRO, na.rm = TRUE)
+
+# Ulcer Index
+ulcer_portfolio <- sqrt(mean(sp500_df$Drawdown_Portfolio^2, na.rm = TRUE))
+ulcer_market <- sqrt(mean(sp500_df$Drawdown_Market^2, na.rm = TRUE))
+ulcer_upro <- sqrt(mean(sp500_df$Drawdown_UPRO^2, na.rm = TRUE))
+
+# Create Table
+results_table <- data.frame(
+  Metric = c("CAGR", "Volatility", "Sharpe Ratio", "Max Drawdown", "Ulcer Index"),
+  Portfolio = c(strategy_cagr, vol_portfolio, sharpe_portfolio, max_drawdown_portfolio, ulcer_portfolio),
+  Market = c(spy_cagr, vol_market, sharpe_market, max_drawdown_market, ulcer_market),
+  UPRO = c(upro_cagr, vol_upro, sharpe_upro, max_drawdown_upro, ulcer_upro)
+)
+
+results_table_transposed <- data.frame(
+  Strategy = c("VALA", "SPY", "UPRO"),
+  CAGR = c(strategy_cagr, spy_cagr, upro_cagr),
+  Volatility = c(vol_portfolio, vol_market, vol_upro),
+  Sharpe_Ratio = c(sharpe_portfolio, sharpe_market, sharpe_upro),
+  Max_Drawdown = c(max_drawdown_portfolio, max_drawdown_market, max_drawdown_upro),
+  Ulcer_Index = c(ulcer_portfolio, ulcer_market, ulcer_upro)
+)
+```
+
+```{r}
+formattable(results_table_transposed, list(
+  CAGR = color_tile("white", "lightgreen"),
+  Volatility = color_tile("white", "lightcoral"),
+  Sharpe_Ratio = color_tile("white", "lightgreen"),
+  Max_Drawdown = color_tile("white", "lightcoral"),
+  Ulcer_Index = color_tile("white", "lightcoral")
+))
+```
+
+Since 1983, this strategy has an average CAGR of over 17%, nearly double the CAGR of the S&P500. Notice how levering up beta, or stock exposure, is not always a panacea for high returns. Levering up includes the risks of volatility decay and large drawdowns. UPRO has frequently underperformed the S&P500 because of the large drawdowns. While timing market crashes is *difficult*, markets exhibit autocorrelation in volatility—meaning that volatility can be predicted with some degree of accuracy.
+
+Using this statistical feature, this strategy is able to manage it's volatility exposure and avoid unnecessarily large swings in markets.
+
+```{r}
+#| label: subset
+#| warning: false
+#| echo: false
+subset_cagr_data <- subset(plot_data_combined, Strategy != "UPRO")
+
+```
+
+```{r}
+
+
+# Function to calculate 5-year rolling CAGR
+calculate_rolling_cagr <- function(cumulative_returns, window = 252) {
+  rollapply(
+    cumulative_returns + 1,  # Add 1 to the cumulative returns for the CAGR calculation
+    width = window, 
+    FUN = function(x) {
+      (tail(x, 1) / head(x, 1))^(252 / window) - 1  # Adjusted for the number of trading days in a year
+    }, 
+    fill = NA, 
+    align = "right") }
+  
+  # Calculate the 5-year rolling CAGR for both strategy and market
+subset_cagr_data <- subset_cagr_data %>%
+  group_by(Strategy) %>%
+  mutate(
+    Rolling_CAGR = calculate_rolling_cagr(Cumulative_Returns)
+  ) %>%
+  ungroup()
+
+ggplot(subset_cagr_data, aes(x = Date)) +  
+  geom_line(aes(y = 1 + Rolling_CAGR, color = Strategy), size = 1, alpha = .8) +  # 5-year Rolling CAGR as a line plot
+  labs(
+    title = "5-Year Rolling CAGR",
+    x = "Date",
+    y = "CAGR",
+    color = "Strategy"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "bottom"
+  )
+
+```
+
+Looking at the rolling CAGR, the strategy is able to periods of very high CAGR while having a downside relative to the S&P500. With any higher volatility strategy, there are periods of underachievement of course.
+
+```{r}
+#| label: code code
+#| warning: false
+#| echo: false
+sp500_df <- sp500_df %>%
+  mutate(
+    Cumulative_Portfolio_Peak = cummax(Cumulative_Portfolio),  # Rolling peak for portfolio
+    Drawdown_Portfolio = (Cumulative_Portfolio - Cumulative_Portfolio_Peak) / Cumulative_Portfolio_Peak,  # Portfolio drawdown
+    
+    Cumulative_Market_Peak = cummax(Cumulative_Market),  # Rolling peak for market
+    Drawdown_Market = (Cumulative_Market - Cumulative_Market_Peak) / Cumulative_Market_Peak,  # Market drawdown
+    
+    Cumulative_UPRO_Peak = cummax(Cumulative_UPRO),  # Rolling peak for UPRO
+    Drawdown_UPRO = (Cumulative_UPRO - Cumulative_UPRO_Peak) / Cumulative_UPRO_Peak  # UPRO drawdown
+  )
+
+```
+
+```{r}
+ggplot() +
+  geom_line(data = sp500_df, aes(x = Date, y = Drawdown_Portfolio, color = "Portfolio"), size = 1) +
+  geom_line(data = sp500_df, aes(x = Date, y = Drawdown_Market, color = "Market"), size = 1) +
+  geom_line(data = sp500_df, aes(x = Date, y = Drawdown_UPRO, color = "UPRO", alpha = 0.8), size = 1) +
+  scale_y_continuous(labels = scales::percent) +  # Convert y-axis to percentage format
+  labs(
+    title = "Drawdowns of Portfolio, Market (SPY), and UPRO",
+    x = "Date",
+    y = "Drawdown (%)",
+    color = "Strategy"
+  ) +
+   # Customize colors
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "top"
+  )
+
+```
+
+While the drawdowns experienced by the strategy are worse than the S&P500, the volatility management is successful in avoiding huge drawdowns like UPRO experiences. Thus, we are able to lever up during bull markets while minimize drawdowns by de-levering during periods of high volatility.
+
+While the model is able to avoid the flash crash of 1987, the largest risk for a framework like this are large crashes from an exogenous source.
+
+```{r}
+correlation <- cor(sp500_df$Forecasted_Volatility, sp500_df$Percentage_Change)
+
+# Load ggplot2 for visualization
+library(ggplot2)
+
+# Create a scatter plot
+ggplot(sp500_df, aes(x = (Forecasted_Volatility), y = Percentage_Change)) +
+  geom_point(alpha = 0.6, color = "blue") +  # Scatterplot points
+  labs(
+    title = "Relationship between Daily Volatility and Daily Returns",
+    x = "Forecasted Volatility",
+    y = "Percentage Change"
+  ) +
+  theme_minimal() +
+  geom_smooth(method = "lm", color = "red", linetype = "dashed") +  # Add linear trendline
+  annotate(
+    "text", 
+    x = max(sp500_df$Forecasted_Volatility, na.rm = TRUE), 
+    y = max(sp500_df$Percentage_Change, na.rm = TRUE), 
+    label = paste("Correlation:", round(correlation, 2)),
+    hjust = 1, vjust = 1, size = 5, color = "darkred"
+  )  # Add the correlation as text
+```
+
+```{r}
+strategy_returns <- sp500_df$Portfolio_Return
+spy_returns <- sp500_df$Percentage_Change
+upro_returns <- sp500_df$Adjusted_UPRO_Returns
+
+returns_df <- data.frame(
+  Date = sp500_df$Date,
+  Strategy = strategy_returns,
+  SPY = spy_returns,
+  UPRO = upro_returns
+)
+
+# Remove NAs
+returns_df <- returns_df %>% drop_na()
+
+returns_df <- returns_df %>%
+  rename(
+    Strategy = GSPC.Close,
+    SPY = GSPC.Close.1,
+    UPRO = UPRO
+  )
+```
+
+Let's dig a bit deeper into the distribution of returns
+
+```{r}
+#| label: effiecient frontier
+#| warning: false
+#| echo: false
+# Step 1: Calculate excess returns (returns minus risk-free rate)
+strategy_excess <- sp500_df$Portfolio_Return - sp500_df$DGS3MO/252
+spy_excess <- sp500_df$Percentage_Change - sp500_df$DGS3MO/252
+upro_excess <- sp500_df$Adjusted_UPRO_Returns - sp500_df$DGS3MO/252
+
+# Combine into a data frame
+returns_df <- data.frame(
+  Strategy = strategy_excess,
+  SPY = spy_excess,
+  UPRO = upro_excess
+)
+
+returns_df <- returns_df %>%
+  rename(
+    Strategy = GSPC.Close,
+    SPY = GSPC.Close.1,
+    UPRO = UPRO
+  )
+
+# Step 2: Generate random weights for portfolio combinations
+set.seed(123)
+num_portfolios <- 10000
+weights <- matrix(runif(num_portfolios * 3), ncol = 3)
+weights <- weights / rowSums(weights)  # Normalize weights to sum to 1
+
+# Step 3: Calculate portfolio mean and standard deviation
+portfolio_stats <- apply(weights, 1, function(w) {
+  portfolio_return <- sum(w * colMeans(returns_df))
+  portfolio_sd <- sqrt(t(w) %*% cov(returns_df) %*% w)
+  c(portfolio_return, portfolio_sd)
+})
+
+portfolio_stats <- as.data.frame(t(portfolio_stats))
+names(portfolio_stats) <- c("Return", "Risk")
+portfolio_stats$Sharpe <- portfolio_stats$Return / portfolio_stats$Risk
+
+# Add mean and SD for the three strategies to overlay as points
+strategy_points <- data.frame(
+  Asset = c("Strategy", "SPY", "UPRO"),
+  Risk = c(sd(strategy_excess), sd(spy_excess), sd(upro_excess)),
+  Return = c(mean(strategy_excess), mean(spy_excess), mean(upro_excess)),
+  Sharpe = c(mean(strategy_excess) / sd(strategy_excess), 
+             mean(spy_excess) / sd(spy_excess), 
+             mean(upro_excess) / sd(upro_excess)))
+
+
+skewness <- function(x) {
+  # Remove NA values
+  x <- na.omit(x)
+  
+  # Calculate the mean
+  mean_x <- mean(x)
+  
+  # Number of observations
+  n <- length(x)
+  
+  # Calculate skewness using the formula
+  numerator <- sum((x - mean_x)^3)
+  denominator <- (n - 1) * (sd(x)^3)
+  
+  # Return skewness
+  skew <- numerator / denominator
+  return(skew)
+}
+
+kurtosis <- function(x) {
+  # Remove NA values
+  x <- na.omit(x)
+  
+  # Number of observations
+  n <- length(x)
+  
+  # Calculate the mean
+  mean_x <- mean(x)
+  
+  # Calculate the standard deviation
+  sd_x <- sd(x)
+  
+  # Calculate the kurtosis numerator
+  numerator <- sum((x - mean_x)^4)
+  
+  # Calculate the kurtosis denominator
+  denominator <- (n - 1) * (sd_x^4)
+  
+  # Excess kurtosis
+  kurt <- numerator / denominator - 3  # Subtracting 3 to get excess kurtosis
+  
+  return(kurt)
+}
+
+```
+
+### **Efficient Frontier Chart**
+
+**Analysis**:\
+The efficient frontier chart illustrates the trade-off between risk (volatility) and return for the three strategies: SPY, UPRO, and VALA.
+
+-   **Key Observations**:
+
+    -   **SPY**: Positioned lower on the risk-return spectrum, SPY provides stable but relatively lower returns compared to the other strategies. This reflects its passive exposure to the S&P 500.
+
+    -   **UPRO**: Located at the high-risk, high-return end of the spectrum, UPRO showcases the substantial rewards of leveraged exposure but with significantly higher volatility.
+
+    -   **VALA**: Positioned between SPY and UPRO, VALA demonstrates an optimized balance, achieving higher returns than SPY with less risk than UPRO. It lies closer to the theoretical "efficient frontier," indicating its effectiveness in maximizing returns for a given level of risk.
+
+**Conclusion**:\
+VALA’s position highlights its ability to harness leverage dynamically while mitigating risk, outperforming SPY in returns and offering a far more controlled risk profile than UPRO. This efficient balance underscores the strategy's robustness and practicality for achieving superior risk-adjusted returns.
+
+```{r}
+ # Plot the efficient frontier with markers for the strategies
+ggplot(portfolio_stats, aes(x = Risk, y = Return, color = Sharpe)) +
+  geom_point(alpha = 0.6, size = 1) +
+  geom_point(data = strategy_points, aes(x = Risk, y = Return), color = "black", size = 4, shape = 18) +
+  geom_text(data = strategy_points, aes(x = Risk, y = Return, label = Asset), nudge_y = 0.0005, size = 4) +
+  scale_color_gradient(low = "blue", high = "red") +
+  labs(
+    title = "Efficient Frontier with VALA",
+    x = "Risk (Standard Deviation)",
+    y = "Return (Excess Mean)",
+    color = "Sharpe Ratio"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+This chart shows the density distributions of daily returns for SPY, UPRO, and VALA.
+
+-   **Key Observations**:
+
+    -   UPRO has the widest distribution, reflecting its high volatility and potential for extreme gains or losses.
+
+    -   SPY has a narrow and centered distribution, reflecting stable returns.
+
+    -   VALA’s distribution lies between SPY and UPRO, with slightly fatter tails but a higher mean return than SPY.
+
+```{r}
+ggplot(returns_df) +
+  geom_density(aes(x = Strategy, fill = "Strategy"), alpha = 0.4) +
+  geom_density(aes(x = SPY, fill = "SPY"), alpha = 0.4) +
+  geom_density(aes(x = UPRO, fill = "UPRO"), alpha = 0.4) +
+  labs(
+    title = "Comparison of Returns Distributions",
+    x = "Returns",
+    y = "Density"
+  ) +
+  theme_minimal() +
+  xlim(-0.15, 0.15) +  # Trim x-axis
+  geom_vline(xintercept = 0, color = "black", linetype = "dotted") +  # Reference line
+  scale_fill_manual(
+    name = "Legend",
+    values = c("Strategy" = "blue", "SPY" = "green", "UPRO" = "red")
+  ) +
+  theme(
+    legend.position = "top",  # Adjust legend position
+    legend.title = element_text(face = "bold")
+  )
+
+# Print the combined plot
+
+strategy_returns <- na.omit(as.numeric(strategy_returns))
+spy_returns <- na.omit(as.numeric(spy_returns))
+upro_returns <- na.omit(as.numeric(upro_returns))
+
+asset_names <- c("VALA", "SPY", "UPRO")
+means <- c(mean(strategy_returns), mean(spy_returns), mean(upro_returns))
+sds <- c(sd(strategy_returns), sd(spy_returns), sd(upro_returns))
+skewnesses <- c(skewness(strategy_returns), skewness(spy_returns), skewness(upro_returns))
+kurtoses <- c(kurtosis(strategy_returns), kurtosis(spy_returns), kurtosis(upro_returns))
+
+# Create the data frame
+summary_stats <- data.frame(
+  Asset = asset_names,
+  Mean = means,
+  SD = sds,
+  Skewness = skewnesses,
+  Kurtosis = kurtoses
+)
+
+# Print the summary statistics
+
+formattable(summary_stats, 
+            list(
+              Mean = color_tile("white", "lightgreen"),
+              SD = color_tile("white", "lightcoral"),
+              Skewness = color_tile("white", "lightgreen"),
+              Kurtosis = color_tile("white", "lightcoral")
+            ))
+```
+Let's see how our GARCH model fits the data by seeing if the residuals are stationary (and our predictions and actual volatility are cointegrated)
+
+
+```{r}
+#| label: cointegration
+#| warning: false
+
+sp500_df <- sp500_df %>%
+  mutate(
+    Realized_Volatility = rollapply(
+      Log_Returns^2, 
+      width = 21, # Rolling window size (e.g., 1 month of daily data)
+      FUN = function(x) sqrt(mean(x, na.rm = TRUE)),
+      fill = NA,
+      align = "right"
+    )
+  )
+
+# Compute residuals
+sp500_df <- sp500_df %>%
+  mutate(Residuals = Realized_Volatility - Forecasted_Volatility)
+
+sp500_df1 <- sp500_df %>% drop_na()
+
+# Check residual stationarity using Augmented Dickey-Fuller test
+adf_test <- tseries::adf.test(sp500_df1$Residuals[!is.na(sp500_df1$Residuals)], alternative = "stationary")
+
+# Print ADF test result
+print(adf_test)
+
+# Plot forecasted vs realized volatility
+plot(sp500_df1$Date, sp500_df1$Realized_Volatility, type = "l", col = "blue", 
+     ylab = "Volatility", xlab = "Date", main = "Forecasted vs Realized Volatility")
+lines(sp500_df1$Date, sp500_df1$Forecasted_Volatility, col = "red")
+legend("topright", legend = c("Realized", "Forecasted"), col = c("blue", "red"), lty = 1)
+
+# Plot residuals
+plot(sp500_df1$Date, sp500_df1$Residuals, type = "l", col = "purple",
+     ylab = "Residuals", xlab = "Date", main = "Residuals of Forecasted vs Realized Volatility")
+
+```
+
+```{r}
+#| label: cointegration2
+#| warning: false
+
+# Plot residuals
+plot(sp500_df1$Date, sp500_df1$Residuals, type = "l", col = "purple",
+     ylab = "Residuals", xlab = "Date", main = "Residuals of Forecasted vs Realized Volatility")
+
+```
+
+
+
+
+## 5. Block Bootstrapping as a robustness test
+
+```{r}
+#| label: bootstrapping
+#| warning: false
+#| echo: false
+
+
+block_bootstrap <- function(data, block_size = 252, num_blocks = 2, variables) {
+  # Initialize an empty list to store the blocks
+  bootstrap_blocks <- list()
+  
+  # Total rows in the data
+  total_rows <- nrow(data)
+  
+  # Loop to generate the blocks
+  for (i in 1:num_blocks) {
+    # Randomly select a starting index for the block
+    start_index <- sample(1:(total_rows - block_size + 1), 1)
+    
+    # Extract the block of data
+    block <- data[start_index:(start_index + block_size - 1), variables, drop = FALSE]
+    
+    # Append the block to the list
+    bootstrap_blocks[[i]] <- block
+  }
+  
+  # Combine the blocks into a single data frame
+  bootstrap_sample <- do.call(rbind, bootstrap_blocks)
+  
+  return(bootstrap_sample)
+}
+
+# Example usage
+# Subset the desired variables from sp500_df
+subset_data <- sp500_df[, c("Percentage_Change", "Adjusted_UPRO_Returns", "Log_Returns")]
+
+# Apply the block bootstrap function
+bootstrap_sample <- block_bootstrap(
+  data = subset_data,
+  block_size = 252,
+  num_blocks = 2,
+  variables = c("Percentage_Change", "Adjusted_UPRO_Returns", "Log_Returns")
+)
+
+bootstrap_sample <- bootstrap_sample %>%
+  mutate(Index = seq_len(nrow(bootstrap_sample)))
+
+# View the result
+head(bootstrap_sample)
+```
+
+4 bootstraps
+
+```{r}
+#| label: bootstrap datasim
+#| warning: false
+#| echo: false
+library(dplyr)
+library(ggplot2)
+library(zoo)
+
+# Number of iterations
+num_iterations <- 4
+
+# List to store plot data for each iteration
+all_iterations_plot_data <- list()
+
+# Loop for 5 iterations
+for (iter in 1:num_iterations) {
+  # Perform block bootstrap
+  bootstrap_sample <- block_bootstrap(
+    data = subset_data,
+    block_size = 252,
+    num_blocks = 30,
+    variables = c("Percentage_Change", "Adjusted_UPRO_Returns", "Log_Returns")
+  )
+  
+  # Add Index column
+  bootstrap_sample <- bootstrap_sample %>%
+    mutate(Index = seq_len(nrow(bootstrap_sample)))
+  
+  # Forecast volatility
+  window_size <- 504
+  out_of_sample_vol_spy <- rep(NA, nrow(bootstrap_sample))
+  
+  for (i in seq(window_size, nrow(bootstrap_sample) - 1)) {
+    rolling_window <- bootstrap_sample$Log_Returns[(i - window_size + 1):i]
+    
+    fit_spy <- tryCatch({
+      FitML(spec, rolling_window)
+    }, error = function(e) NA)
+    
+    if (!is.na(fit_spy)) {
+      forecast <- tryCatch({
+        predict(fit_spy, n.ahead = 1)
+      }, error = function(e) list(vol = 0))
+      
+      out_of_sample_vol_spy[i + 1] <- forecast$vol[1]
+    } else {
+      out_of_sample_vol_spy[i + 1] <- 0
+    }
+  }
+  
+  # Replace zeros with the previous non-zero value
+  out_of_sample_vol_spy <- zoo::na.locf(out_of_sample_vol_spy, na.rm = FALSE)
+  
+  # Add forecasted volatility
+  bootstrap_sample <- bootstrap_sample %>%
+    mutate(Forecasted_Volatility = out_of_sample_vol_spy) %>%
+    drop_na(Forecasted_Volatility)
+  
+  # Portfolio simulation parameters
+  target_vol <- 0.17 / sqrt(252)
+  initial_investment <- 100
+  leverage_power <- 20
+  threshold <- 1
+  
+  bootstrap_sample <- bootstrap_sample %>%
+  mutate(
+    Leverage = pmin((target_vol / Forecasted_Volatility)^leverage_power, 3),
+    Previous_Leverage = lag(Leverage, 1),
+    Rebalance = ifelse(abs(Leverage - Previous_Leverage) >= threshold, 1, 0),
+    Leverage_Adjusted = ifelse(Rebalance == 1, Leverage, lag(Leverage, 1)),
+    Weight_UPRO_Adjusted = pmin(Leverage_Adjusted / 3, 1),
+    Weight_SPY_Adjusted = 1 - Weight_UPRO_Adjusted,
+    Percentage_Change = Percentage_Change, # Store percentage change for reference
+    Adjusted_UPRO_Returns = Adjusted_UPRO_Returns, # Store UPRO returns for reference
+    Portfolio_Return = Weight_SPY_Adjusted * Percentage_Change + Weight_UPRO_Adjusted * Adjusted_UPRO_Returns
+  ) %>%
+  filter(!is.na(Weight_SPY_Adjusted) & !is.na(Weight_UPRO_Adjusted)) %>%
+  mutate(
+    Cumulative_Portfolio = initial_investment * cumprod(1 + Portfolio_Return),
+    Cumulative_Market = initial_investment * cumprod(1 + Percentage_Change),
+    Cumulative_UPRO = initial_investment * cumprod(1 + Adjusted_UPRO_Returns)
+  )
+  
+  # Prepare data for plotting
+  plot_data <- bootstrap_sample %>%
+    select(Index, Cumulative_Portfolio, Cumulative_Market, Cumulative_UPRO) %>%
+    pivot_longer(cols = starts_with("Cumulative"), names_to = "Strategy", values_to = "Cumulative_Returns") %>%
+    mutate(Iteration = paste0("Iteration ", iter))
+  
+  # Append to list
+  all_iterations_plot_data[[iter]] <- plot_data
+}
+
+# Combine all iterations for plotting
+combined_plot_data <- bind_rows(all_iterations_plot_data)
+```
+
+```{r}
+ggplot(combined_plot_data, aes(x = Index, y = Cumulative_Returns, color = Strategy)) +
+  geom_line(size = 1) +
+  scale_y_log10() +
+  facet_wrap(~Iteration, scales = "free", labeller = label_both) +  # Use 'scales = "free"' to ensure each plot can have different y-axis scales
+  labs(
+    title = "Bootstrapped Returns",
+    x = "Index",
+    y = "Cumulative Returns (Log Scale)",
+    color = "Strategy"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 45, hjust = 1)  # Rotate x-axis text for readability
+  )
+```
+
+Block Bootstrapping allows us to preserve the temporal dependence of the historic data. This means that the autocorrelation of the volatility can be retained. However, boostrapping enables the simulation of plausable but unrealized market events. This test of robustness ensures that VALA is not data-mined and that we are not over-fitting the hyper-parameters of the model.
+
+While VALA does not always outperform, especially in bear markets versus the S&P500 or in long bull markets versus UPRO, it does consistently provide levered beta without the dramatic drawdowns.
+
+Let's see the summary statistics
+
+```{r}
+#| label: table display
+#| warning: false
+#| echo: false
+library(dplyr)
+library(tidyr)
+library(formattable)
+
+# Updated calculate_metrics function
+calculate_metrics <- function(data) {
+  # Ensure sufficient rows
+  if (nrow(data) < 2) return(c(CAGR = NA, Volatility = NA, Sharpe = NA, Ulcer = NA))
+  
+  # Extract cumulative returns
+  cumulative_returns <- data$Cumulative_Returns
+  
+  # Calculate daily returns from cumulative returns
+  daily_returns <- diff(cumulative_returns) / lag(cumulative_returns, default = cumulative_returns[1])
+  
+  # Calculate CAGR
+  cagr <- ((tail(cumulative_returns, 1) / head(cumulative_returns, 1))^(1 / 30) - 1)
+  
+  # Calculate Volatility (annualized)
+  volatility <- sd(daily_returns, na.rm = TRUE) * sqrt(252) * 100
+  
+  # Calculate Sharpe Ratio
+  sharpe <- ifelse(volatility > 0, cagr / volatility, NA)
+  
+  # Calculate Ulcer Index
+  max_drawdown <- cumulative_returns / cummax(cumulative_returns) - 1
+  ulcer_index <- mean(abs(max_drawdown), na.rm = TRUE) * 100
+  
+  return(c(CAGR = cagr, Volatility = volatility, Sharpe = sharpe, Ulcer = ulcer_index))
+}
+
+# Process metrics for each bootstrap iteration
+metrics_list <- lapply(all_iterations_plot_data, function(plot_data) {
+  plot_data %>%
+    group_by(Strategy) %>%
+    summarise(
+      Metrics = list(calculate_metrics(cur_data())),
+      .groups = "drop"
+    ) %>%
+    unnest_wider(Metrics)
+})
+
+# Combine all iterations into one table
+combined_metrics <- bind_rows(metrics_list, .id = "Iteration")
+
+
+combined_metrics <- combined_metrics %>%
+  mutate(
+    Strategy = recode(Strategy,                             # Rename Strategy to Iteration
+                       "Cumulative_Market" = "SPY",         # Rename Cumulative_Market to SPY
+                       "Cumulative_Portfolio" = "VALA",     # Rename Cumulative_Portfolio to VALA
+                       "Cumulative_UPRO" = "UPRO")         # Rename Cumulative_UPRO to UPRO
+  )
+
+
+formatted_metrics <- formattable(
+  combined_metrics, 
+  align = 'c', 
+  list(
+    Iteration = formatter("span", style = ~style(color = "black", font.weight = "bold")), # Highlight Iteration
+    Strategy = formatter("span", style = ~style(color = "darkgray", font.weight = "bold")), # Highlight Strategy
+    CAGR = color_tile("white", "lightgreen"),
+    Volatility = color_tile("white", "lightcoral"),
+    Sharpe = color_tile("white", "lightgreen"),
+    Ulcer = color_tile("white", "lightcoral")
+  ),
+  theme = "basic" # Use basic theme for simplicity
+)
+
+
+
+```
+
+```{r}
+# Display the formatted table
+formatted_metrics
+```
+
+text
+
+```{r}
+#| label: another table
+#| warning: false
+#| echo: false
+# Create a base table with Iteration as the primary column
+base_table <- combined_metrics %>%
+  select(Iteration, Strategy, CAGR, Volatility, Sharpe, Ulcer)
+
+# Convert to a nested format with Iteration as the main group
+nested_table <- base_table %>%
+  group_by(Iteration) %>%
+  nest() %>%
+  mutate(data = purrr::map(data, ~{
+    # Format each sub-table within the iteration
+    formattable(.x, align = 'c', list(
+      Iteration = formatter("span", style = ~style(color = "black", font.weight = "bold")), # Highlight Iteration
+      Strategy = formatter("span", style = ~style(color = "darkgray", font.weight = "bold")), # Highlight Strategy
+      CAGR = color_tile("white", "lightgreen"),
+      Volatility = color_tile("white", "lightblue"),
+      Sharpe = color_tile("white", "lightcoral"),
+      Ulcer = color_tile("white", "lightyellow")
+    ))
+  }))
+
+# Use knittr to create a table with formatted metrics
+knitr::kable(
+  nested_table$data,
+  format = "markdown",
+  booktabs = TRUE,
+  stripe = TRUE,
+  caption = "Performance Metrics by Iteration and Strategy"
+)
+
+```
+
+```{r}
+#| label: more tables
+#| warning: false
+#| echo: false
+# Load necessary packages
+library(dplyr)
+library(gt)
+library(scales)  # for color scales if needed
+
+# Create a base table with Iteration as the primary column
+base_table <- combined_metrics %>%
+  select(Iteration, Strategy, CAGR, Volatility, Sharpe, Ulcer)
+
+# Convert to a nested format with Iteration as the main group
+nested_table <- base_table %>%
+  group_by(Iteration) %>%
+  nest()
+
+gt_table <- nested_table %>%
+  unnest(cols = data) %>%
+  gt() %>%
+  tab_header(
+    title = "Performance Metrics by Iteration and Strategy"
+  ) %>%
+  cols_label(
+    Iteration = "Iteration",
+    Strategy = "Strategy",
+    CAGR = "CAGR",
+    Volatility = "Volatility",
+    Sharpe = "Sharpe",
+    Ulcer = "Ulcer"
+  ) %>%
+  tab_spanner(
+    label = "Metrics",
+    columns = c(CAGR, Volatility, Sharpe, Ulcer)
+  ) %>%
+  cols_align(align = "center") %>%
+  tab_style(
+    style = cell_fill(color = "lightgrey"),
+    locations = cells_body(columns = vars(Strategy))
+  ) %>%
+  opt_row_striping() %>%
+  data_color(
+    columns = vars(CAGR, Sharpe),
+    colors = scales::col_numeric(
+      palette = c("white", "lightgreen"),
+      domain = NULL
+    )
+  ) %>%
+  data_color(
+    columns = vars(Volatility, Ulcer),
+    colors = scales::col_numeric(
+      palette = c("white", "red"),
+      domain = NULL
+    )
+  )
+
+```
+
+```{r}
+# Display the gt table
+gt_table
+```
