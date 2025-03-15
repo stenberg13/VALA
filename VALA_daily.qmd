@@ -1,0 +1,429 @@
+---
+title: "VALA_Daily"
+format: html
+output: html_document
+---
+
+## Quarto
+
+Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
+
+## Running Code
+
+When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
+
+```{r}
+#tickers and date range
+library(quantmod)
+library(rugarch)
+library(MSGARCH)
+library(zoo)
+library(foreach)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+ticker <- "^GSPC"
+start_date <- "2023-01-21"
+end_date <- Sys.Date()
+
+# Download data
+getSymbols(ticker, from = start_date, to = end_date, src = "yahoo", adjust = TRUE)
+
+# Convert to dataframes and add Date column
+sp500_df <- as.data.frame(GSPC) %>%
+  mutate(Date = index(GSPC))
+
+# Pull the 3-month Treasury bill rate (DGS3MO) from FRED
+getSymbols("DGS3MO", src = "FRED", from = start_date, to = end_date)
+
+# Convert the data to a dataframe and adjust the column name
+tbill_df <- data.frame(
+  Date = index(DGS3MO),
+  TBill_Rate = DGS3MO$DGS3MO / 100 # Convert to decimal
+)
+
+# Fill missing values using the previous non-NA value
+tbill_df$DGS3MO <- zoo::na.locf(tbill_df$DGS3MO, na.rm = FALSE)
+max(sp500_df$Date)
+last_date <- max(tbill_df$Date)
+
+next_trading_day <- function(date) {
+  next_day <- date + 1
+  while (weekdays(next_day) %in% c("Saturday", "Sunday")) {
+    next_day <- next_day + 1
+  }
+  return(next_day)
+}
+
+
+
+latest_sp500_date <- max(sp500_df$Date)
+
+
+# Filter and fill forward DGS3MO up to the latest SP500 trading date
+tbill_df <- tbill_df %>%
+  filter(Date <= latest_sp500_date) %>% # Only include dates up to latest SP500 date
+  complete(Date = seq.Date(min(Date), latest_sp500_date, by = "day")) %>% # Ensure all dates in range
+  mutate(DGS3MO = na.locf(DGS3MO, na.rm = FALSE)) # Fill forward again
+
+
+
+sp500_df <- sp500_df %>%
+  left_join(tbill_df, by = "Date")
+tail(sp500_df)
+# Calculate log returns for SP500
+sp500_df <- sp500_df %>%
+  mutate(
+    Log_Returns = log(Cl(GSPC) / lag(Cl(GSPC))),
+    Percentage_Change = (Cl(GSPC) / lag(Cl(GSPC)) - 1)
+  ) %>%
+  drop_na()
+
+# Calculate Adjusted UPRO Returns
+sp500_df$Adjusted_UPRO_Returns <- (sp500_df$Percentage_Change * 3) - sp500_df$DGS3MO / 252 - (0.0091/252) - (0.015/252)
+
+next_trading_day <- function(date) {
+  next_day <- date + 1
+  while (weekdays(next_day) %in% c("Saturday", "Sunday")) {
+    next_day <- next_day + 1
+  }
+  return(next_day)
+}
+
+# Find the latest date in your dataset
+last_date <- max(sp500_df$Date)
+
+# Calculate the next trading day
+new_date <- next_trading_day(last_date)
+
+# Create a new row for the next trading day with today's values
+new_row <- sp500_df %>%
+  filter(Date == last_date) %>%
+  mutate(Date = new_date)
+
+# Append the new row to the dataset
+sp500_df <- rbind(sp500_df, new_row)
+str(sp500_df)
+# Fill any missing values, if necessary
+sp500_df <- sp500_df %>%
+  arrange(Date) %>%
+  fill(everything(), .direction = "down")
+
+
+# Prepare for forecasting volatility (using GARCH model)
+# Set rolling window size for volatility forecast
+window_size <- 504
+#spec <- CreateSpec(variance.spec = list(model = c("sGARCH")), 
+#                  distribution.spec = list(distribution = c("std")))
+
+spec <- CreateSpec(
+  variance.spec = list(model = c("sGARCH", "sGARCH")),
+  distribution.spec = list(distribution = c("std", "std")),
+  switch.spec = list(do.mix = FALSE)
+)
+
+
+
+
+# Prepare to store out-of-sample volatility forecasts
+out_of_sample_vol_spy <- rep(NA, nrow(sp500_df))
+progress_counter <- 0
+total_iterations <- nrow(sp500_df) - window_size
+
+# Forecast volatility using rolling window and GARCH model
+for (i in seq(window_size, nrow(sp500_df) - 1)) {
+  rolling_window <- sp500_df$Log_Returns[(i - window_size + 1):i]
+  
+  fit_spy <- tryCatch({
+    FitML(spec, rolling_window)
+  }, error = function(e) {
+    NA  # Return NA if there's an error
+  })
+  
+  if (!is.na(fit_spy)) {
+    forecast <- tryCatch({
+      predict(fit_spy, n.ahead = 1)
+    }, error = function(e) {
+      list(vol = 0)  # If forecasting fails, set volatility to 0
+    })
+    
+    out_of_sample_vol_spy[i + 1] <- forecast$vol[1]
+  } else {
+    out_of_sample_vol_spy[i + 1] <- 0
+  }
+  
+  progress_counter <- progress_counter + 1
+  print(paste("Loop", progress_counter, "out of", total_iterations))
+}
+
+# Replace zeros with the previous non-zero value
+out_of_sample_vol_spy <- zoo::na.locf(out_of_sample_vol_spy, na.rm = FALSE)
+
+sp500_df <- sp500_df %>%
+  mutate(Forecasted_Volatility = out_of_sample_vol_spy)
+tail(sp500_df)
+sp500_df <- sp500_df %>%
+  drop_na(Forecasted_Volatility)
+```
+
+You can add options to executable code like this
+
+```{r}
+#| echo: false
+# Define parameters
+target_vols <- c(0.17 / sqrt(252))  # Target volatility (in daily terms)
+threshold <- 1  
+leverage = 20 # Threshold for rebalancing (when the difference in leverage exceeds this, rebalance)
+initial_investment = 10  # Initial investment amount
+
+# Initialize result list
+results <- list()
+
+# Loop over the target volatilities
+for (V_target in target_vols) {
+  
+  sp500_df <- sp500_df %>%
+    # Calculate today's leverage based on forecasted volatility
+    mutate(
+      Leverage = pmin((V_target / Forecasted_Volatility)^leverage, 3),  # Apply dynamic leverage power
+      
+      # Store the previous day's leverage
+      Previous_Leverage = lag(Leverage, 1),
+      
+      # Check if the leverage change exceeds the threshold compared to the previous day's leverage
+      Rebalance = ifelse(abs(Leverage - Previous_Leverage) >= threshold, 1, 0),  # Only rebalance if the difference exceeds threshold
+      
+      # Adjust leverage based on rebalancing, otherwise retain previous leverage
+      Leverage_Adjusted = ifelse(Rebalance == 1, Leverage, lag(Leverage, 1)),
+      
+      # Calculate weights for SPY and UPRO based on the adjusted leverage
+      Weight_UPRO_Adjusted = pmin(Leverage_Adjusted / 3, 1),  # UPRO weight based on leverage
+      Weight_SPY_Adjusted = 1 - Weight_UPRO_Adjusted         # SPY weight is the remainder
+    ) %>%
+    # Filter out rows with NA leverage (typically the first row)
+    filter(!is.na(Weight_SPY_Adjusted) & !is.na(Weight_UPRO_Adjusted))
+  
+  # Compute portfolio returns and cumulative portfolio value
+  sp500_df <- sp500_df %>%
+    mutate(
+      Portfolio_Return = Weight_SPY_Adjusted * Percentage_Change + Weight_UPRO_Adjusted * Adjusted_UPRO_Returns,
+      Cumulative_Portfolio = initial_investment * cumprod(1 + Portfolio_Return)
+    )
+  
+  # Store results for this parameter combination
+  results[[paste0("Vol_", V_target)]] <- sp500_df %>%
+    select(Date, Leverage, Weight_SPY_Adjusted, Weight_UPRO_Adjusted, Portfolio_Return, Cumulative_Portfolio)
+}
+head(sp500_df)
+# Add the cumulative returns for SPY to results_clean
+sp500_df <- sp500_df %>%
+  mutate(Cumulative_Market = initial_investment * cumprod(1 + Percentage_Change))
+
+tail(sp500_df)
+# Ensure all cumulative returns are numeric in the strategy results
+results_clean <- lapply(results, function(df) {
+  df %>%
+    mutate(
+      Portfolio_Return = as.numeric(Portfolio_Return),  # Convert xts to numeric
+      Cumulative_Portfolio = as.numeric(Cumulative_Portfolio)    )
+})
+
+# Combine the SPY (market) cumulative return with the strategy returns
+plot_data <- bind_rows(lapply(names(results_clean), function(vol_target) {
+  results_clean[[vol_target]] %>%
+    mutate(Strategy = vol_target)
+}), .id = "Strategy")
+
+# Add the market data (SPY cumulative return) to plot_data, ensure Cumulative_Market is numeric
+market_data <- sp500_df %>%
+  select(Date, Cumulative_Market) %>%
+  mutate(Strategy = "Market", Cumulative_Market = as.numeric(Cumulative_Market))  # Convert Cumulative_Market to numeric
+
+# Combine strategies and market data
+plot_data_combined <- bind_rows(
+  plot_data %>%
+    rename(Cumulative_Returns = Cumulative_Portfolio) %>%
+    select(Date, Strategy, Cumulative_Returns),
+  market_data %>%
+    rename(Cumulative_Returns = Cumulative_Market) %>%
+    select(Date, Strategy, Cumulative_Returns)
+)
+
+```
+
+```{r}
+# Plot cumulative returns with log scale
+ggplot(plot_data_combined, aes(x = Date, y = 1 + Cumulative_Returns, color = Strategy)) +
+  geom_line(size = 1) +
+  scale_y_log10() +  # Apply log scale
+  labs(
+    title = "Cumulative Returns for Strategies and Market",
+    x = "Date",
+    y = "Cumulative Returns (Log Scale)",
+    color = "Strategy"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "bottom"
+  )
+
+```
+
+```{r}
+# Define the current leverage based on target volatility and forecasted volatility
+sp500_df <- sp500_df %>%
+  mutate(
+    # Calculate today's leverage based on forecasted volatility
+    Current_Leverage = pmin((target_vols / Forecasted_Volatility)^10, 3)  # Apply dynamic leverage power
+  )
+
+# Calculate the previous day's leverage using lag()
+sp500_df <- sp500_df %>%
+  mutate(
+    Previous_Leverage = lag(Current_Leverage, 1)  # Get the previous day's leverage
+  )
+
+# Now, we check if rebalancing is needed by comparing current and previous leverage
+sp500_df <- sp500_df %>%
+  mutate(
+    Rebalance = ifelse(abs(Current_Leverage - Previous_Leverage) >= threshold, 1, 0)  # Rebalance condition
+  )
+
+# Check if rebalancing is needed on the last day (latest row)
+latest_row <- nrow(sp500_df)
+rebalance_needed <- sp500_df$Rebalance[latest_row] == 1
+
+
+# Subset the last 20 years of data (20 * 252 trading days)
+last_20_years <- sp500_df %>%
+  tail(47 * 252)
+
+
+
+realized_vol_window <- 21  # 21 trading days for approximately one month
+
+# Calculate realized volatility (rolling standard deviation of returns)
+sp500_df <- sp500_df %>%
+  mutate(
+    Realized_Volatility = rollapply(
+      Log_Returns,
+      width = realized_vol_window,
+      FUN = function(x) sqrt(mean(x^2)),
+      align = "right",
+      fill = NA
+    ),
+    Residuals = Realized_Volatility - Forecasted_Volatility  # Calculate residuals
+  )
+
+# Filter to ensure no NA values in Residuals
+plot_data_residuals <- sp500_df %>%
+  filter(!is.na(Residuals))
+```
+
+```{r}
+
+# Plot residuals over time
+ggplot(plot_data_residuals, aes(x = Date, y = Residuals)) +
+  geom_line(color = "blue", size = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Residuals: Realized Volatility - Forecasted Volatility",
+    x = "Date",
+    y = "Residuals"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
+
+```{r}
+# Print the rebalancing status and the allocation if rebalance is needed
+if (rebalance_needed) {
+  weight_upro <- pmin(sp500_df$Current_Leverage[latest_row] / 3, 1)  # UPRO weight
+  weight_spy <- 1 - weight_upro  # SPY weight
+  print(paste("Rebalancing needed today! New allocation: SPY =", round(weight_spy, 2), ", UPRO =", round(weight_upro, 2)))
+} else {
+  # Access current allocation in SPY and UPRO
+  current_weight_upro <- sp500_df$Weight_UPRO_Adjusted[latest_row]
+  current_weight_spy <- 1 - current_weight_upro
+  print(paste("No rebalance needed today. Current allocation: SPY =", round(current_weight_spy, 2), ", UPRO =", round(current_weight_upro, 2)))
+}
+
+
+
+
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# Define the periods where Weight_UPRO_Adjusted == 1
+shaded_regions <- last_20_years %>%
+  filter(Weight_UPRO_Adjusted == 1) %>%
+  group_by(group = cumsum(c(0, diff(Date) != 1))) %>% # Group consecutive dates
+  summarize(start = first(Date), end = last(Date), .groups = "drop")
+
+# Create the plot
+ggplot(last_20_years) +
+  # Add shaded regions for periods where Weight_UPRO_Adjusted == 1
+  # Adjust opacity and color
+  # Plot the Forecasted_Volatility line
+  geom_line(aes(x = Date, y = Forecasted_Volatility), color = "red", size = 1) +
+  # Plot the Weight_UPRO_Adjusted line
+  geom_line(aes(x = Date, y = Weight_UPRO_Adjusted / 12), color = "lightblue", size = 1, alpha = 0.6) +
+  # Add y-axis labels
+  scale_y_continuous(
+    name = "Weight in UPRO",
+    sec.axis = sec_axis(~ ., name = "Forecasted Volatility")  # Secondary y-axis for Forecasted Volatility
+  ) +
+  # Add labels and theme
+  labs(
+    title = "Weight in UPRO and Forecasted Volatility Over Time (Last 20 Years)",
+    x = "Date",
+    color = "Strategy"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5)
+  )
+```
+
+```{r}
+
+upro_df <- sp500_df %>%
+  mutate(Cumulative_UPRO = initial_investment * cumprod(1 + Adjusted_UPRO_Returns))
+
+tail(upro_df)  # Check final values
+
+# Ensure Cumulative_UPRO is numeric and properly formatted
+upro_data <- upro_df %>%
+  select(Date, Cumulative_UPRO) %>%
+  mutate(Strategy = "UPRO", Cumulative_UPRO = as.numeric(Cumulative_UPRO)) %>%  # Convert to numeric
+  rename(Cumulative_Returns = Cumulative_UPRO)
+
+# Combine UPRO with existing plot data
+plot_data_combined <- bind_rows(
+  plot_data_combined,
+  upro_data
+)
+```
+
+```{r}
+# Plot cumulative returns with log scale
+ggplot(plot_data_combined, aes(x = Date, y = 1 + Cumulative_Returns, color = Strategy)) +
+  geom_line(size = 1) +
+  scale_y_log10() +  # Apply log scale
+  labs(
+    title = "Cumulative Returns for Strategies, Market, and UPRO",
+    x = "Date",
+    y = "Cumulative Returns (Log Scale)",
+    color = "Strategy"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "bottom"
+  )
+```
