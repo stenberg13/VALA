@@ -17,6 +17,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y r-base
 
+      - name: Install R packages
+        run: |
+          R -e "install.packages('rmarkdown')"
+          R -e "install.packages('knitr')"  # In case you need knitr for rendering
+
       - name: Set up Quarto
         uses: quarto-dev/quarto-actions/setup@v2
         with:
