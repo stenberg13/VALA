@@ -20,7 +20,7 @@ jobs:
 
       - name: Render Quarto Document
         run: |
-          quarto render VALA/VALA_daily.qmd
+          quarto render VALA_daily.qmd
 
       - name: Publish to GitHub Pages (and render)
         uses: quarto-dev/quarto-actions/publish@v2
